@@ -8,7 +8,9 @@ Each cycle verifies both provider actors, reads both account notification inboxe
 
 The provider's dates remain distinct from API read time. Edited responses have distinct event identities. Responses without creation dates retain null creation dates. Query responses always say counts are lower bounds and peers can improve the tool and adapters. Expired current aggregate values become null, with dated reported values retained. The latest-batch query is not the corpus. Search ceilings, partial search results, provider denials and all outstanding history remain explicit.
 
-Cloud reads are available directly through `github_cloud_interactions.mjs --read` with the existing shared credential and custody-key references in the process environment. They do not require this PC, port 8893, or its SQLite database. A local UI or MCP adapter may display that read; it is a consumer of cloud data.
+Cloud reads are available directly through `github_cloud_interactions.mjs --read`, or the portable stdio MCP server `--mcp`, with the existing shared credential and custody-key references in the process environment. They do not require this PC, port 8893, or its SQLite database. A local UI or MCP adapter may display that read; it is a consumer of cloud data. Peer pagination pins an immutable event-batch asset and retains the same filters across every cursor.
+
+The visible cloud workflow runs four finite captures spaced five minutes apart. After its third durable capture it queues a successor, with workflow concurrency allowing only one active collector. An hourly provider schedule provides recovery. Handoff checks the workflow's actual enabled state and stops if the owner disables it. This is a telemetry-only observer: no inference, engineering tasks, tests, contact, demo transport or work authorization.
 
 ## Capacity and durability
 

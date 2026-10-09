@@ -1,7 +1,7 @@
 name: GitHub interaction telemetry
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '7 * * * *'
   workflow_dispatch:
 permissions:
   contents: read
@@ -12,7 +12,7 @@ jobs:
   capture:
     if: github.repository == 'tokenjunkielabs/swarm-telemetry-cloud'
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,4 +24,4 @@ jobs:
           SWARM_GITHUB_MAIN_TOKEN: ${{ secrets.SWARM_GITHUB_MAIN_TOKEN }}
           SWARM_SOURCE_CUSTODY_KEY: ${{ secrets.SWARM_SOURCE_CUSTODY_KEY }}
           SWARM_CUSTODY_REPO: tokenjunkielabs/swarm-telemetry-custody
-        run: node integrations/swarm_telemetry/cloud/github_cloud_interactions.mjs
+        run: node integrations/swarm_telemetry/cloud/github_cloud_interactions.mjs --daemon
