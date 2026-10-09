@@ -20,18 +20,28 @@ export function unseal(record,key){
 }
 export function project(rows,{kind,account,at,source_ref}){
   return rows.filter(x=>x&&typeof x==='object').map(x=>{
-    const actor=x.user||x.actor||{},url=x.html_url||x.url||x.subject?.url||null;
-    const occurred_at=x.submitted_at||x.created_at||null,updated_at=x.updated_at||occurred_at;
-    const id=x.node_id||x.id||url;
-    return {event_id:sha(JSON.stringify([account,kind,id,updated_at,x.state,x.body])),event_type:'github_interaction',kind,
+    const entity=x.payload?.comment||x.payload?.pull_request||x.payload?.issue||x;
+    const actor=entity.user||x.user||x.actor||{},url=entity.html_url||entity.url||x.html_url||x.url||x.subject?.url||null;
+    const occurred_at=entity.submitted_at||entity.created_at||x.created_at||null,updated_at=entity.updated_at||x.updated_at||occurred_at;
+    const id=entity.node_id||entity.id||x.node_id||x.id||url;
+    return {event_id:sha(JSON.stringify([account,'github-provider-record',id,updated_at,entity.state,entity.body])),event_type:'github_interaction',kind,
       account_ref:account,provider_id:id,url,actor_login:actor.login||null,actor_id:actor.id||null,
       direction:actor.login?actor.login===account.split('/').at(-1)?'outgoing':'incoming':'unknown',
       occurred_at,provider_updated_at:updated_at,observed_at:at,source_ref,
-      state:x.state||null,reason:x.reason||null,body:x.body??null,title:x.title||x.subject?.title||null,
-      repository:x.repository?.full_name||null,subject_url:x.subject?.url||null,latest_comment_url:x.subject?.latest_comment_url||null};
+      state:entity.state||null,reason:x.reason||null,body:entity.body??null,title:entity.title||x.subject?.title||null,
+      provider_event_type:x.type||x.event||null,provider_event_occurred_at:x.created_at||null,reaction_type:x.content||null,merged_at:entity.merged_at||entity.pull_request?.merged_at||null,closed_at:entity.closed_at||null,
+      repository:x.repository?.full_name||x.repo?.name||null,subject_url:x.subject?.url||null,latest_comment_url:x.subject?.latest_comment_url||null};
   });
 }
 export function nextLink(headers){return /<([^>]+)>;\s*rel="next"/.exec(headers.get('link')||'')?.[1]||null;}
+export function dedupeInteractions(rows){const found=new Map();for(const row of rows){const prior=found.get(row.event_id);if(prior){prior.source_refs.push(row.source_ref);prior.observed_at=row.observed_at;}else found.set(row.event_id,{...row,source_refs:[row.source_ref]});}return [...found.values()];}
+export function partitionSearch(job,total,upper){
+  if(!job.kind.startsWith('search_interactions')||total<=1000)return [];
+  const range=job.range||{since:'1970-01-01T00:00:00.000Z',until:upper},start=Date.parse(range.since),end=Date.parse(range.until);
+  if(end-start<=1000)return [];
+  const mid=new Date(Math.floor((start+end)/2000)*1000).toISOString(),u=new URL(apiURL(job.endpoint)),base=job.base_query||u.searchParams.get('q');
+  return [{since:range.since,until:mid},{since:mid,until:range.until}].map(part=>{const url=new URL(u);url.searchParams.set('q',base+' created:>='+part.since+' created:<'+part.until);url.searchParams.delete('page');return {...job,kind:'search_interactions_history',endpoint:url.toString(),base_query:base,range:part,priority:0};});
+}
 function apiURL(path){const u=new URL(path,'https://api.github.com');if(u.origin!=='https://api.github.com')throw Error('provider_origin_rejected');return u.toString();}
 export function selectSubjectJobs(pending){
   const hot=pending.filter(x=>Number(x.priority||0)>0),cold=pending.filter(x=>Number(x.priority||0)<=0);
@@ -39,15 +49,25 @@ export function selectSubjectJobs(pending){
   while(selected.length<8&&(hot.length||cold.length))selected.push((hot.length?hot:cold).shift());
   return {selected,remaining:[...hot,...cold]};
 }
-export async function readCloud({token,key,repo='tokenjunkielabs/swarm-telemetry-custody',now=Date.now()}){
+export function pageInteractions(value,args={}){
+  let offset=0,asset_id=value.pinned_events_asset_id||value.pointer.events_asset_id;
+  if(args.cursor){const p=JSON.parse(Buffer.from(args.cursor,'base64url'));if(p.direction!==args.direction||p.kind!==args.kind||p.asset_id!==asset_id)throw Error('cloud_cursor_filters_changed');offset=p.offset;}
+  const rows=value.events.filter(x=>(!args.direction||x.direction===args.direction)&&(!args.kind||x.kind===args.kind)),limit=Math.max(1,Math.min(1000,args.limit||100)),end=Math.min(rows.length,offset+limit);
+  if(!Number.isSafeInteger(offset)||offset<0)throw Error('invalid_cloud_cursor');
+  return {...value,events:rows.slice(offset,end),next_cursor:end<rows.length?Buffer.from(JSON.stringify({asset_id,offset:end,direction:args.direction,kind:args.kind})).toString('base64url'):null,has_more:end<rows.length,current_interaction_event_count:value.fresh?rows.length:null,reported_interaction_event_count:rows.length};
+}
+export async function readCloud({token,key,repo='tokenjunkielabs/swarm-telemetry-custody',now=Date.now(),asset_id=null}){
   async function get(path,binary=false){const r=await fetch(apiURL(path),{headers:{Authorization:'Bearer '+token,Accept:binary?'application/octet-stream':'application/vnd.github+json'},signal:AbortSignal.timeout(25000)});if(!r.ok)throw Error('cloud_read_'+r.status);return binary?Buffer.from(await r.arrayBuffer()):r.json();}
   const release=await get('/repos/'+repo+'/releases/tags/telemetry-custody-v1'),pointer=JSON.parse(release.body||'{}');
-  if(!pointer.events_asset_id)return {status:'pending',events:[],counts_are_lower_bounds:true,corpus_complete:false,peer_note:NOTE};
-  const original=JSON.parse(await get('/repos/'+repo+'/releases/assets/'+pointer.events_asset_id,true));
-  const batch=JSON.parse(unseal(original,key)),status=JSON.parse(await get('/repos/'+repo+'/releases/assets/'+pointer.status_asset_id,true));
+  const selected=asset_id||pointer.events_asset_id;
+  if(!selected)return {status:'pending',events:[],counts_are_lower_bounds:true,corpus_complete:false,peer_note:NOTE};
+  if(!Number.isSafeInteger(selected)||selected<=0)throw Error('invalid_cloud_asset');
+  const original=JSON.parse(await get('/repos/'+repo+'/releases/assets/'+selected,true));
+  const batch=JSON.parse(unseal(original,key)),status=asset_id?{observed_at:batch.observed_at,reads:batch.reads.length,interaction_events:batch.events.length,pending_subjects:null}:JSON.parse(await get('/repos/'+repo+'/releases/assets/'+pointer.status_asset_id,true));
   const age=(now-Date.parse(batch.observed_at))/1000,fresh=age>=0&&age<=300;
+  const provider_status={...status,reported_values:{reads:status.reads,interaction_events:status.interaction_events,pending_subjects:status.pending_subjects},reads:fresh?status.reads:null,interaction_events:fresh?status.interaction_events:null,pending_subjects:fresh?status.pending_subjects:null};
   return {...batch,status:'observed',age_seconds:age,fresh,current_interaction_event_count:fresh?batch.events.length:null,reported_interaction_event_count:batch.events.length,
-    execution_state:fresh?'observed':'unknown',provider_status:status,source_custody_repo:repo,pointer,
+    execution_state:'unknown',collector_observation_state:fresh?'observed':'unknown',provider_status,source_custody_repo:repo,pointer,pinned_events_asset_id:selected,
     history_scope:'Latest retained cloud batch only; earlier encrypted batches and provider history remain independently retained. This page is not the corpus.',
     counts_are_lower_bounds:true,corpus_complete:false,peer_note:NOTE};
 }
@@ -97,7 +117,8 @@ export async function run(env=process.env){
   for(const [account] of identities){
     const login=account.split('/').at(-1);
     roots.push({account,credential:account,kind:'notifications',endpoint:'/notifications?all=true&per_page=100'});
-    roots.push({account,credential:'github/tokenjunkielabs',kind:'received_events',endpoint:'/users/'+login+'/received_events?per_page=100'});
+    roots.push({account,credential:account,kind:'received_events',endpoint:'/users/'+login+'/received_events?per_page=100'});
+    roots.push({account,credential:account,kind:'user_events',endpoint:'/users/'+login+'/events?per_page=100'});
     for(const term of ['author:','involves:','review-involves:'])roots.push({account,credential:'github/tokenjunkielabs',kind:'search_interactions',endpoint:'/search/issues?'+new URLSearchParams({q:term+login,sort:'updated',order:'desc',per_page:'100'})});
   }
   const selected=roots.filter(x=>x.kind==='notifications'),rotating=roots.filter(x=>x.kind!=='notifications');
@@ -115,23 +136,28 @@ export async function run(env=process.env){
     events.push(...project(rows,{kind:job.kind,account:job.account,at:response.at,source_ref}));
     for(const row of rows){
       for(const target of [row.subject?.url,row.subject?.latest_comment_url,row.pull_request?.url]){
-        if(target&&target.startsWith('https://api.github.com/'))state.pending_subjects.push({account:job.account,credential:'github/tokenjunkielabs',kind:'subject',endpoint:target,priority:job.kind==='notifications'?2:1,provider_updated_at:row.updated_at});
+        if(target&&target.startsWith('https://api.github.com/'))state.pending_subjects.push({account:job.account,credential:row.repository?.private?job.account:'github/tokenjunkielabs',kind:'subject',endpoint:target,priority:job.kind==='notifications'?2:1,provider_updated_at:row.updated_at});
       }
       const u=row.url||'',m=/\/repos\/([^/]+\/[^/]+)\/(?:issues|pulls)\/(\d+)$/.exec(u);
       if(m&&(job.kind.startsWith('search_interactions')||job.kind==='subject')){
         for(const [kind,suffix] of [['issue_comments','issues/'+m[2]+'/comments'],['timeline','issues/'+m[2]+'/timeline'],...(row.pull_request||u.includes('/pulls/')?[['reviews','pulls/'+m[2]+'/reviews'],['review_comments','pulls/'+m[2]+'/comments']]:[])])state.pending_subjects.push({account:job.account,credential:'github/tokenjunkielabs',kind,endpoint:'/repos/'+m[1]+'/'+suffix+'?per_page=100',priority:job.priority||1,provider_updated_at:row.updated_at});
       }
+      if(m&&row.user?.login===job.account.split('/').at(-1))state.pending_subjects.push({account:job.account,credential:job.credential,kind:'issue_reactions',endpoint:'/repos/'+m[1]+'/issues/'+m[2]+'/reactions?per_page=100',priority:1,provider_updated_at:row.updated_at});
+      const comment=/\/repos\/([^/]+\/[^/]+)\/(issues|pulls)\/comments\/(\d+)$/.exec(u);
+      if(comment&&row.user?.login===job.account.split('/').at(-1))state.pending_subjects.push({account:job.account,credential:job.credential,kind:'comment_reactions',endpoint:'/repos/'+comment[1]+'/'+comment[2]+'/comments/'+comment[3]+'/reactions?per_page=100',priority:1,provider_updated_at:row.updated_at});
     }
     const next=nextLink(response.r.headers);
-    if(next){if(roots.includes(job))state.pending_subjects.push({...job,kind:job.kind+'_backfill',endpoint:next,priority:0});else state.pending_subjects.push(job);}
-    state.selectors[sid]={next_endpoint:roots.includes(job)?null:next,last_read_at:response.at,source_ref,last_status:response.r.status,complete:!next,provider_incomplete_results:payload.incomplete_results??null,provider_total_count:payload.total_count??null,unread_regions:payload.total_count>1000?['GitHub search ceiling; date-partition backfill pending']:[]};
+    let history_partition=checkpoint.history_partition;
+    if(payload.total_count>1000&&!history_partition){const children=partitionSearch(job,payload.total_count,response.at);state.pending_subjects.push(...children);history_partition={children:children.map(x=>x.endpoint),upper_bound:response.at};}
+    if(next&&(payload.total_count??0)<=1000){if(roots.includes(job))state.pending_subjects.push({...job,kind:job.kind+'_backfill',endpoint:next,priority:0});else state.pending_subjects.push(job);}
+    state.selectors[sid]={next_endpoint:roots.includes(job)?null:next,last_read_at:response.at,source_ref,last_status:response.r.status,complete:!next&&!payload.incomplete_results&&!(payload.total_count>1000),provider_incomplete_results:payload.incomplete_results??null,provider_total_count:payload.total_count??null,history_partition,unread_regions:payload.total_count>1000?['GitHub search ceiling; date-partition children remain independently pending']:[]};
   }
   state.pending_subjects=[...new Map(state.pending_subjects.map(x=>[JSON.stringify([x.account,x.kind,x.endpoint]),x])).values()];
-  const at=new Date().toISOString(),batch=sha(JSON.stringify(reads));
-  const eventsAssetId=await blob('events/'+at.replace(/[:.]/g,'-')+'-'+batch+'.json',JSON.stringify(seal(Buffer.from(JSON.stringify({observed_at:at,events,reads,peer_note:NOTE,counts_are_lower_bounds:true,corpus_complete:false})),key)));
+  const at=new Date().toISOString(),batch=sha(JSON.stringify(reads)),unique=dedupeInteractions(events);
+  const eventsAssetId=await blob('events/'+at.replace(/[:.]/g,'-')+'-'+batch+'.json',JSON.stringify(seal(Buffer.from(JSON.stringify({observed_at:at,events:unique,reads,peer_note:NOTE,counts_are_lower_bounds:true,corpus_complete:false})),key)));
   state.observed_at=at;state.peer_note=NOTE;state.counts_are_lower_bounds=true;state.corpus_complete=false;
   const stateAssetId=await blob('state/current.json',JSON.stringify(seal(Buffer.from(JSON.stringify(state)),key)));
-  const summary={observed_at:at,reads:reads.length,interaction_events:events.length,pending_subjects:state.pending_subjects.length,counts_are_lower_bounds:true,corpus_complete:false,peer_note:NOTE,provider_read_watermarks:reads.map(x=>({account_ref:x.context.account_ref,kind:x.context.kind,at:x.actual_api_return_at,status:x.http_status,ref:x.source_ref})),scope:'Account notifications, received events, authored/participated/reviewed subjects and replies; historical coverage incomplete'};
+  const summary={observed_at:at,reads:reads.length,interaction_events:unique.length,pending_subjects:state.pending_subjects.length,counts_are_lower_bounds:true,corpus_complete:false,peer_note:NOTE,provider_read_watermarks:reads.map(x=>({account_ref:x.context.account_ref,credential_ref:x.context.credential_ref,kind:x.context.kind,at:x.actual_api_return_at,status:x.http_status,ref:x.source_ref})),scope:'Account-scoped retained provider-record versions, coalescing duplicate source observations; notifications, account events, subjects, replies and reactions; historical coverage incomplete'};
   const statusAssetId=await blob('status/latest.json',JSON.stringify(summary));
   const current=await readJSON('/repos/'+repo+'/releases/'+release.id);if(current.body!==release.body)throw Error('cloud_checkpoint_changed');
   const nextPointer=JSON.stringify({state_asset_id:stateAssetId,status_asset_id:statusAssetId,events_asset_id:eventsAssetId,source_release_id:shard.id,batch,observed_at:at});
@@ -139,4 +165,9 @@ export async function run(env=process.env){
   const actual=await readJSON('/repos/'+repo+'/releases/'+release.id);if(actual.body!==nextPointer)throw Error('cloud_cursor_commit_unconfirmed');
   console.log(JSON.stringify({...summary,release_id:release.id,state_asset_id:stateAssetId,cloud_custody_verified:true}));return summary;
 }
-if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){const task=process.argv.includes('--read')?readCloud({token:process.env.SWARM_GITHUB_WORKING_TOKEN,key:Buffer.from(process.env.SWARM_SOURCE_CUSTODY_KEY||'','base64')}).then(x=>console.log(JSON.stringify(x))):run();task.catch(e=>{console.error(JSON.stringify({status:'unknown',error:String(e.message).replace(/[^a-zA-Z0-9_:-]/g,'').slice(0,120),counts_are_lower_bounds:true,corpus_complete:false,peer_note:NOTE}));process.exitCode=1;});}
+if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){
+  if(process.argv.includes('--mcp')){
+    const {createInterface}=await import('node:readline');const rl=createInterface({input:process.stdin});
+    for await(const line of rl){let request;try{request=JSON.parse(line);let result={};if(request.method==='initialize')result={protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'swarm-github-cloud-telemetry',version:'1.0.0'}};else if(request.method==='tools/list')result={tools:[{name:'get_github_interactions',description:'Read cloud account interactions. Measurements are a lower bound; peers can improve this tool and adapters.',inputSchema:{type:'object',properties:{direction:{type:'string',enum:['incoming','outgoing','unknown']},limit:{type:'integer',minimum:1,maximum:1000},cursor:{type:'string'},kind:{type:'string'}},additionalProperties:false},annotations:{readOnlyHint:true,destructiveHint:false}}]};else if(request.method==='tools/call'){const a=request.params?.arguments||{},p=a.cursor?JSON.parse(Buffer.from(a.cursor,'base64url')):null;const value=pageInteractions(await readCloud({token:process.env.SWARM_GITHUB_WORKING_TOKEN,key:Buffer.from(process.env.SWARM_SOURCE_CUSTODY_KEY||'','base64'),asset_id:p?.asset_id}),a);result={content:[{type:'text',text:JSON.stringify(value)}],structuredContent:value,isError:false};}else if(request.method?.startsWith('notifications/'))continue;console.log(JSON.stringify({jsonrpc:'2.0',id:request.id,result}));}catch(e){console.log(JSON.stringify({jsonrpc:'2.0',id:request?.id,error:{code:-32000,message:'cloud_read_unavailable'},peer_note:NOTE}));}}
+  }else{const task=process.argv.includes('--read')?readCloud({token:process.env.SWARM_GITHUB_WORKING_TOKEN,key:Buffer.from(process.env.SWARM_SOURCE_CUSTODY_KEY||'','base64')}).then(x=>console.log(JSON.stringify(x))):run();task.catch(e=>{console.error(JSON.stringify({status:'unknown',error:String(e.message).replace(/[^a-zA-Z0-9_:-]/g,'').slice(0,120),counts_are_lower_bounds:true,corpus_complete:false,peer_note:NOTE}));process.exitCode=1;});}
+}
