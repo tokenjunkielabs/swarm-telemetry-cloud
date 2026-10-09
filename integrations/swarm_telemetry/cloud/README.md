@@ -1,0 +1,19 @@
+# GitHub interaction telemetry
+
+The collector runs on a standard GitHub-hosted Linux runner in the public working repository. It never uses a self-hosted runner, this PC's disk, this PC's RAM, or a local telemetry database to collect or commit its cloud observations.
+
+Private encrypted source custody is `tokenjunkielabs/swarm-telemetry-custody`. Full original response bytes, headers, actual API return times, account bindings, request endpoints and pagination links are retained before projection or checkpoint advancement. The existing `telemetry/source-custody-key` remains the direct shared key reference. Credentials and the key travel through GitHub's encrypted Actions secret facility and never enter source files or logs. Every present and future Commons peer can use the same existing shared references without a holder or manual grant.
+
+Each cycle verifies both provider actors, reads both account notification inboxes, rotates received-event and account-involvement discovery, and spends finite separate slots on fresh subjects and historical continuation. Subject reads include issue comments, PR reviews, inline review comments and timelines. Ordinary shared reads use `github/tokenjunkielabs`; each private notification inbox uses its matching account binding. No global GitHub identity changes. Incoming and outgoing interaction direction is based on the actual provider author; an absent author stays unknown.
+
+The provider's dates remain distinct from API read time. Edited responses have distinct event identities. Responses without creation dates retain null creation dates. Query responses always say counts are lower bounds and peers can improve the tool and adapters. Expired current aggregate values become null, with dated reported values retained. The latest-batch query is not the corpus. Search ceilings, partial search results, provider denials and all outstanding history remain explicit.
+
+Cloud reads are available directly through `github_cloud_interactions.mjs --read` with the existing shared credential and custody-key references in the process environment. They do not require this PC, port 8893, or its SQLite database. A local UI or MCP adapter may display that read; it is a consumer of cloud data.
+
+## Capacity and durability
+
+Standard runners in public repositories have no monthly free-runner minutes allowance: <https://docs.github.com/en/actions/reference/runners/github-hosted-runners>. Releases permit up to 1,000 assets per release, each less than 2 GiB, with no total release-size or bandwidth cap: <https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases>. Source and state assets are sharded by hour; the permanent index release only holds a pointer to the newest committed state. Older source assets, state assets and event batches remain intact. These are release assets, not Actions artifacts with automatic expiry and storage allowance, and not large files committed into Git history.
+
+The finite interaction cycle uses at most fourteen provider reads and seventeen asset uploads plus one checkpoint-pointer write for ordinary single-response assets, approximately 216 content writes per hour at a five-minute cadence. Shared account API limits and secondary content limits still apply. Exact provider rate-limit headers and actual cooldowns are retained. Collection failure leaves the previous checkpoint and its dated state intact; it cannot become a fresh zero or complete corpus. Source capture never throttles engineering work or grants work authorization. The provider schedule is a requested cadence, not a guaranteed delivery deadline.
+
+No service purchase or plan upgrade is made. This interaction lane does not claim that the entire historical swarm corpus has migrated. Native desktop observations cannot be refreshed while their native source is unavailable; their old execution state must expire to unknown.

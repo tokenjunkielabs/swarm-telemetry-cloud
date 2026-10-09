@@ -1,0 +1,27 @@
+name: GitHub interaction telemetry
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: github-interaction-telemetry
+  cancel-in-progress: false
+jobs:
+  capture:
+    if: github.repository == 'tokenjunkielabs/swarm-telemetry-cloud'
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: integrations/swarm_telemetry/cloud
+      - name: Capture exact GitHub responses in cloud custody
+        env:
+          SWARM_GITHUB_WORKING_TOKEN: ${{ secrets.SWARM_GITHUB_WORKING_TOKEN }}
+          SWARM_GITHUB_MAIN_TOKEN: ${{ secrets.SWARM_GITHUB_MAIN_TOKEN }}
+          SWARM_SOURCE_CUSTODY_KEY: ${{ secrets.SWARM_SOURCE_CUSTODY_KEY }}
+          SWARM_CUSTODY_REPO: tokenjunkielabs/swarm-telemetry-custody
+        run: node integrations/swarm_telemetry/cloud/github_cloud_interactions.mjs
